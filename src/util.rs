@@ -53,10 +53,10 @@ mod tests {
     }
     #[test]
     fn number_to_str_radix_test() {
-        assert!(number_to_str_radix(42, 16) == "2A".to_string());
-        assert!(number_to_str_radix(42, 10) == "42".to_string());
-        assert!(number_to_str_radix(42, 0) == "42".to_string());
-        assert!(number_to_str_radix(-42, 10) == "-42".to_string());
-        assert!(number_to_str_radix(-42i16, 16) == "FFD6".to_string());
+        assert_eq!(number_to_str_radix(42, 16), "2A");
+        assert_eq!(number_to_str_radix(42, 10), "42");
+        assert_eq!(number_to_str_radix(42, 0), "42");
+        assert_eq!(number_to_str_radix(-42, 10), "-42");
+        assert_eq!(number_to_str_radix(-42i16, 16), "FFD6");
     }
 }

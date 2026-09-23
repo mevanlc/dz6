@@ -84,6 +84,7 @@ Arguments:
 Options:
   -o, --offset <OFFSET>  Initial cursor offset (hex default; `t` suffix = decimal) [default: 0]
   -r, --readonly         Set read-only mode
+  -l, --link             Opens the contents of softlinks mentioned (as leafs) on the command line directly instead of [attempting] to follow them
   -h, --help             Print help
   -V, --version          Print version
 ```

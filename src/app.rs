@@ -28,10 +28,12 @@ pub struct FileInfo {
     pub file: Option<File>,
     pub path: String,
     pub is_read_only: bool,
+    pub is_symlink: bool,
     pub name: String,
     pub r#type: &'static str,
     pub size: usize,
     pub mmap: Option<MemoryMappedFile>,
+    pub buffer: Option<Vec<u8>>,
 }
 
 impl FileInfo {
@@ -41,6 +43,10 @@ impl FileInfo {
     /// time you access a page that is not mapped it will load from disk to memory by the OS,
     /// which also takes care of unloading it if memory constrained.
     pub fn get_buffer(&mut self) -> &[u8] {
+        if let Some(buffer) = &self.buffer {
+            return buffer.as_slice();
+        }
+
         if let Some(mmap) = self.mmap.as_mut() {
             return mmap.as_slice_bytes(0, self.size as u64).unwrap();
         }
@@ -85,6 +91,19 @@ pub struct App {
     pub string_regex: String,
     pub strings: Vec<FoundString>,
     pub text_view: TextView,
+}
+
+#[cfg(unix)]
+fn read_link_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let target = std::fs::read_link(path)?;
+    Ok(target.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn read_link_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let target = std::fs::read_link(path)?;
+    Ok(target.to_string_lossy().into_owned().into_bytes())
 }
 
 impl App {
@@ -228,8 +247,15 @@ impl App {
         filepath: &str,
         initial_offset: usize,
         read_only: bool,
+        open_symlink: bool,
     ) -> io::Result<()> {
-        let path = Path::new(&filepath);
+        let clean_path =
+            if filepath.len() > 1 && (filepath.ends_with('/') || filepath.ends_with('\\')) {
+                filepath.trim_end_matches(['/', '\\'])
+            } else {
+                filepath
+            };
+        let path = Path::new(clean_path);
 
         if let Some(f) = path.file_name()
             && let Some(fname) = f.to_str()
@@ -238,26 +264,41 @@ impl App {
             self.file_info.path = String::from(filepath);
         }
 
-        let meta = path.metadata()?;
-
-        // We try to open file readwrite to use this later for saving
-        if !read_only && let Ok(file) = OpenOptions::new().read(true).write(true).open(path) {
-            self.file_info.file = Some(file);
-        } else {
+        let symlink_meta = path.symlink_metadata()?;
+        if open_symlink && symlink_meta.file_type().is_symlink() {
+            let link_bytes = read_link_bytes(path)?;
+            self.file_info.size = link_bytes.len();
+            self.file_info.buffer = Some(link_bytes);
             self.file_info.is_read_only = true;
-        }
-
-        // We map it on memory readonly as changed to mapped memory also changes it on disk
-        if let Ok(mmap) = MemoryMappedFile::builder(path)
-            .mode(MmapMode::ReadOnly)
-            .open()
-        {
-            self.file_info.mmap = Some(mmap);
+            self.file_info.is_symlink = true;
+            self.file_info.file = None;
+            self.file_info.mmap = None;
         } else {
-            return Err(std::io::Error::other("could not open file"));
-        }
+            let meta = path.metadata()?;
 
-        self.file_info.size = meta.len() as usize;
+            // We try to open file readwrite to use this later for saving
+            if !read_only && let Ok(file) = OpenOptions::new().read(true).write(true).open(path) {
+                self.file_info.file = Some(file);
+                self.file_info.is_read_only = false;
+            } else {
+                self.file_info.file = None;
+                self.file_info.is_read_only = true;
+            }
+
+            // We map it on memory readonly as changed to mapped memory also changes it on disk
+            if let Ok(mmap) = MemoryMappedFile::builder(path)
+                .mode(MmapMode::ReadOnly)
+                .open()
+            {
+                self.file_info.mmap = Some(mmap);
+            } else {
+                return Err(std::io::Error::other("could not open file"));
+            }
+
+            self.file_info.size = meta.len() as usize;
+            self.file_info.is_symlink = false;
+            self.file_info.buffer = None;
+        }
 
         if self.file_info.size > 0 {
             _ = self.id_file();
@@ -283,8 +324,13 @@ impl App {
 
     pub fn reload_file(&mut self) {
         let fp = self.file_info.path.clone();
-        self.load_file(&fp, self.hex_view.offset, self.file_info.is_read_only)
-            .expect("could not reload the file");
+        self.load_file(
+            &fp,
+            self.hex_view.offset,
+            self.file_info.is_read_only,
+            self.file_info.is_symlink,
+        )
+        .expect("could not reload the file");
     }
 
     /// write what's cached to the actual file
@@ -433,5 +479,145 @@ impl App {
         }
 
         String::from_utf8(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_load_file_regular() {
+        let dir = std::env::temp_dir().join(format!("dz6-test-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("regular.txt");
+        let mut f = File::create(&file_path).unwrap();
+        f.write_all(b"regular file content").unwrap();
+        drop(f);
+
+        let mut app_no_link = App::new();
+        app_no_link
+            .load_file(file_path.to_str().unwrap(), 0, false, false)
+            .unwrap();
+        assert_eq!(app_no_link.file_info.get_buffer(), b"regular file content");
+        assert!(!app_no_link.file_info.is_symlink);
+
+        let mut app_link = App::new();
+        app_link
+            .load_file(file_path.to_str().unwrap(), 0, false, true)
+            .unwrap();
+        assert_eq!(app_link.file_info.get_buffer(), b"regular file content");
+        assert!(!app_link.file_info.is_symlink);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("dz6-test-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target_path = dir.join("target.txt");
+        let mut f = File::create(&target_path).unwrap();
+        f.write_all(b"target file content").unwrap();
+        drop(f);
+
+        let link_path = dir.join("link_to_target");
+        symlink("target.txt", &link_path).unwrap();
+
+        // Without -l (open_symlink = false): follows symlink to target
+        let mut app_follow = App::new();
+        app_follow
+            .load_file(link_path.to_str().unwrap(), 0, false, false)
+            .unwrap();
+        assert_eq!(app_follow.file_info.get_buffer(), b"target file content");
+        assert_eq!(app_follow.file_info.size, 19);
+        assert!(!app_follow.file_info.is_symlink);
+
+        // With -l (open_symlink = true): opens softlink contents directly
+        let mut app_link = App::new();
+        app_link
+            .load_file(link_path.to_str().unwrap(), 0, false, true)
+            .unwrap();
+        assert_eq!(app_link.file_info.get_buffer(), b"target.txt");
+        assert_eq!(app_link.file_info.size, 10);
+        assert!(app_link.file_info.is_symlink);
+        assert!(app_link.file_info.is_read_only);
+
+        // Broken symlink
+        let broken_link_path = dir.join("broken_link");
+        symlink("nonexistent.bin", &broken_link_path).unwrap();
+
+        // Without -l: fails
+        let mut app_broken_follow = App::new();
+        assert!(
+            app_broken_follow
+                .load_file(broken_link_path.to_str().unwrap(), 0, false, false)
+                .is_err()
+        );
+
+        // With -l: succeeds and opens contents directly
+        let mut app_broken_link = App::new();
+        app_broken_link
+            .load_file(broken_link_path.to_str().unwrap(), 0, false, true)
+            .unwrap();
+        assert_eq!(app_broken_link.file_info.get_buffer(), b"nonexistent.bin");
+        assert_eq!(app_broken_link.file_info.size, 15);
+        assert!(app_broken_link.file_info.is_symlink);
+        assert!(app_broken_link.file_info.is_read_only);
+
+        // Symlink to symlink
+        let link_to_link_path = dir.join("link_to_link");
+        symlink("link_to_target", &link_to_link_path).unwrap();
+
+        let mut app_nested = App::new();
+        app_nested
+            .load_file(link_to_link_path.to_str().unwrap(), 0, false, true)
+            .unwrap();
+        assert_eq!(app_nested.file_info.get_buffer(), b"link_to_target");
+        assert_eq!(app_nested.file_info.size, 14);
+        assert!(app_nested.file_info.is_symlink);
+
+        // Symlink to directory
+        let real_sub_dir = dir.join("real_sub_dir");
+        std::fs::create_dir_all(&real_sub_dir).unwrap();
+        let sub_file = real_sub_dir.join("sub_file.txt");
+        let mut f = File::create(&sub_file).unwrap();
+        f.write_all(b"sub file content").unwrap();
+        drop(f);
+
+        let dir_link = dir.join("dir_link");
+        symlink("real_sub_dir", &dir_link).unwrap();
+
+        let mut app_dir_link = App::new();
+        app_dir_link
+            .load_file(dir_link.to_str().unwrap(), 0, false, true)
+            .unwrap();
+        assert_eq!(app_dir_link.file_info.get_buffer(), b"real_sub_dir");
+        assert!(app_dir_link.file_info.is_symlink);
+
+        // With trailing slash
+        let mut app_dir_link_slash = App::new();
+        let dir_link_slash_str = format!("{}/", dir_link.to_str().unwrap());
+        app_dir_link_slash
+            .load_file(&dir_link_slash_str, 0, false, true)
+            .unwrap();
+        assert_eq!(app_dir_link_slash.file_info.get_buffer(), b"real_sub_dir");
+        assert!(app_dir_link_slash.file_info.is_symlink);
+
+        // Symlink as intermediate directory component, regular file as leaf
+        let sub_file_via_dir_link = dir_link.join("sub_file.txt");
+        let mut app_leaf_test = App::new();
+        app_leaf_test
+            .load_file(sub_file_via_dir_link.to_str().unwrap(), 0, false, true)
+            .unwrap();
+        // Since sub_file.txt is a regular file (not a symlink leaf), it opens regular file content
+        assert_eq!(app_leaf_test.file_info.get_buffer(), b"sub file content");
+        assert!(!app_leaf_test.file_info.is_symlink);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

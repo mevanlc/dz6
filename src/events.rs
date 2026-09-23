@@ -72,7 +72,8 @@ mod tests {
 
     fn test_app() -> App {
         let mut app = App::new();
-        app.load_file("test_data/test.bin", 0, false).unwrap();
+        app.load_file("test_data/test.bin", 0, false, false)
+            .unwrap();
         update_page_size(&mut app, 5); // set height to 2 so we can test page up/down behavior
         app
     }

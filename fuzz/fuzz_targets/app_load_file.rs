@@ -24,5 +24,5 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut app = App::new();
-    let _ = app.load_file(path, 0, flags & 1 == 0);
+    let _ = app.load_file(path, 0, flags & 1 == 0, flags & 2 != 0);
 });

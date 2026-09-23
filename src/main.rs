@@ -38,6 +38,10 @@ struct Args {
     /// Set read-only mode
     #[arg(short, long)]
     readonly: bool,
+
+    /// Opens the contents of softlinks mentioned (as leafs) on the command line directly instead of [attempting] to follow them
+    #[arg(short = 'l', long, aliases = ["symlink", "leaf"])]
+    link: bool,
 }
 
 fn main() {
@@ -45,7 +49,7 @@ fn main() {
     let mut app = App::new();
     let cursor_offset = util::parse_offset(&args.offset).unwrap_or_default();
 
-    app.load_file(&args.file, cursor_offset, args.readonly)
+    app.load_file(&args.file, cursor_offset, args.readonly, args.link)
         .unwrap_or_else(|e| {
             eprintln!("{}: {}", args.file, e);
             process::exit(1);
